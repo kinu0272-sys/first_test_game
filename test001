@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Number Gate Grow - Prototype</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0b0f14; height:100%; overflow:hidden; }
+    #wrap { width:100%; height:100%; }
+    .hint { position:fixed; left:12px; bottom:10px; color:#9fb3c8; font:14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial; opacity:.9;}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+</head>
+<body>
+<div id="wrap"></div>
+<div class="hint">드래그/마우스로 좌우 이동 · 게이트 통과로 숫자 키우기 · 적(빨강)은 내 숫자가 크면 먹고, 작으면 게임오버</div>
+
+<script>
+(() => {
+  const W = 420, H = 780;
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const fmt = (n) => n >= 1000000 ? (n/1000000).toFixed(1)+"M" : n.toString();
+
+  const config = {
+    type: Phaser.AUTO,
+    parent: "wrap",
+    width: W,
+    height: H,
+    backgroundColor: "#0b0f14",
+    physics: { default: "arcade", arcade: { debug: false } },
+    scene: { preload, create, update }
+  };
+
+  new Phaser.Game(config);
+
+  let player, playerText, laneX, targetX;
+  let gates, enemies, coins;
+  let uiScore, uiBest, uiState;
+  let speed = 210;
+  let score = 0;
+  let best = Number(localStorage.getItem("ng_best") || 0);
+  let state = "PLAY"; // PLAY | OVER
+  let nextSpawnY = -220;
+
+  function preload() {}
+
+  function create() {
+    const scene = this;
+
+    // lanes: 3 lane runner 느낌 (광고 스타일)
+    laneX = [W*0.22, W*0.50, W*0.78];
+    targetX = laneX[1];
+
+    // background grid
+    const g = scene.add.graphics();
+    g.lineStyle(1, 0x16202b, 1);
+    for (let y=0; y<H; y+=40) g.lineBetween(0, y, W, y);
+    for (let x=0; x<W; x+=40) g.lineBetween(x, 0, x, H);
+
+    // player (원 + 숫자)
+    player = scene.physics.add.image(laneX[1], H*0.78, makeCircle(scene, 26, 0x3ddc97));
+    player.setCircle(26);
+    player.setImmovable(true);
+    player.body.allowGravity = false;
+
+    player.value = 5;
+
+    playerText = scene.add.text(player.x, player.y, fmt(player.value), {
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+      fontSize: "18px",
+      color: "#052016",
+      fontStyle: "700"
+    }).setOrigin(0.5);
+
+    // groups
+    gates = scene.physics.add.group({ immovable: true, allowGravity: false });
+    enemies = scene.physics.add.group({ immovable: true, allowGravity: false });
+    coins = scene.physics.add.group({ immovable: true, allowGravity: false });
+
+    // UI
+    uiScore = scene.add.text(12, 12, "SCORE 0", { fontFamily:"system-ui", fontSize:"16px", color:"#cfe3ff" });
+    uiBest  = scene.add.text(W-12, 12, `BEST ${best}`, { fontFamily:"system-ui", fontSize:"16px", color:"#cfe3ff" }).setOrigin(1,0);
+    uiState = scene.add.text(W/2, H*0.40, "", {
+      fontFamily:"system-ui",
+      fontSize:"26px",
+      color:"#ffffff",
+      align:"center"
+    }).setOrigin(0.5).setDepth(10);
+
+    // input: drag to move (광고 감성)
+    scene.input.on("pointerdown", (p) => { if (state==="OVER") restart(scene); });
+    scene.input.on("pointermove", (p) => {
+      if (state!=="PLAY") return;
+      // 화면 좌표에 따라 목표 lane 선택 (손가락 이동)
+      const lx = p.x;
+      const idx = lx < W*0.35 ? 0 : (lx < W*0.65 ? 1 : 2);
+      targetX = laneX[idx];
+    });
+
+    // collisions
+    scene.physics.add.overlap(player, gates, (pl, gate) => {
+      if (!gate.active || state!=="PLAY") return;
+      applyGate(scene, gate);
+    });
+
+    scene.physics.add.overlap(player, enemies, (pl, enemy) => {
+      if (!enemy.active || state!=="PLAY") return;
+      fightEnemy(scene, enemy);
+    });
+
+    scene.physics.add.overlap(player, coins, (pl, coin) => {
+      if (!coin.active || state!=="PLAY") return;
+      coin.destroy();
+      addValue(scene, 1);
+      popText(scene, pl.x, pl.y-30, "+1", 0xffd86b);
+      score += 5;
+      updateUI();
+    });
+
+    // initial spawns
+    for (let i=0; i<6; i++) spawnRow(scene);
+  }
+
+  function update(_, dt) {
+    const scene = this;
+
+    // smooth move to target lane
+    player.x = Phaser.Math.Linear(player.x, targetX, 0.18);
+    playerText.setPosition(player.x, player.y);
+    playerText.setText(fmt(player.value));
+
+    if (state !== "PLAY") return;
+
+    // move world downward
+    const dy = (speed * dt) / 1000;
+    gates.children.iterate(o => { if (o?.active) o.y += dy; });
+    enemies.children.iterate(o => { if (o?.active) o.y += dy; });
+    coins.children.iterate(o => { if (o?.active) o.y += dy; });
+
+    // cleanup + respawn
+    const bottom = H + 120;
+    gates.children.iterate(o => { if (o?.active && o.y > bottom) o.destroy(); });
+    enemies.children.iterate(o => { if (o?.active && o.y > bottom) o.destroy(); });
+    coins.children.iterate(o => { if (o?.active && o.y > bottom) o.destroy(); });
+
+    // spawn rows as we go
+    nextSpawnY += dy;
+    if (nextSpawnY > 0) {
+      spawnRow(scene);
+      nextSpawnY = -220;
+    }
+
+    // score over time
+    score += dt * 0.01;
+    updateUI();
+  }
+
+  function updateUI() {
+    uiScore.setText(`SCORE ${Math.floor(score)}`);
+    uiBest.setText(`BEST ${best}`);
+  }
+
+  function spawnRow(scene) {
+    // 한 줄에: 게이트 2개 + 적 1개 + 코인 1개 정도 (랜덤)
+    const rowY = -80;
+
+    const lanes = [0,1,2];
+    Phaser.Utils.Array.Shuffle(lanes);
+
+    // choose gate lanes (2)
+    const gateLanes = lanes.slice(0,2);
+    const enemyLane = lanes[2];
+
+    // gate values - 광고에서 자주 보이는 + / x 위주로 구성
+    const gateA = makeGate(scene, laneX[gateLanes[0]], rowY, pickGateSpec(scene, player.value));
+    const gateB = makeGate(scene, laneX[gateLanes[1]], rowY, pickGateSpec(scene, player.value));
+
+    gates.add(gateA); gates.add(gateB);
+
+    // enemy with value
+    const eVal = pickEnemyValue(player.value);
+    const enemy = makeEnemy(scene, laneX[enemyLane], rowY, eVal);
+    enemies.add(enemy);
+
+    // coin in random lane sometimes
+    if (Math.random() < 0.65) {
+      const cLane = Phaser.Math.Between(0,2);
+      const coin = makeCoin(scene, laneX[cLane], rowY - 70);
+      coins.add(coin);
+    }
+
+    // 조금씩 난이도 / 속도 상승
+    speed = Math.min(420, speed + 2.0);
+  }
+
+  function pickGateSpec(scene, currentValue) {
+    const roll = Math.random();
+    // value가 낮을 땐 +가 많이 나오게, 커질수록 x, -도 섞기
+    const bias = clamp(currentValue / 60, 0, 1);
+
+    if (roll < 0.55 - 0.25*bias) {
+      const add = Phaser.Math.Between(3, 18);
+      return { op:"+", n:add, label:`+${add}` };
+    } else if (roll < 0.85) {
+      const mul = [2,2,3,3,4][Phaser.Math.Between(0,4)];
+      return { op:"x", n:mul, label:`x${mul}` };
+    } else {
+      const sub = Phaser.Math.Between(5, 25);
+      return { op:"-", n:sub, label:`-${sub}` };
+    }
+  }
+
+  function pickEnemyValue(currentValue) {
+    // 플레이어 값 근처에서 랜덤 (이기기도/지기도)
+    const base = Math.max(2, Math.floor(currentValue * Phaser.Math.FloatBetween(0.45, 1.25)));
+    // 너무 작/큰 값 방지
+    return clamp(base, 2, 999999);
+  }
+
+  function applyGate(scene, gate) {
+    gate.disableBody(true, true);
+
+    const before = player.value;
+    if (gate.spec.op === "+") player.value = before + gate.spec.n;
+    else if (gate.spec.op === "x") player.value = before * gate.spec.n;
+    else if (gate.spec.op === "-") player.value = Math.max(1, before - gate.spec.n);
+
+    // feedback
+    popText(scene, player.x, player.y-48, gate.spec.label, 0x7ee7ff);
+    score += 25;
+    // 광고 느낌: 숫자 커질수록 플레이어 크기도 증가
+    const r = clamp(22 + Math.log10(player.value+1)*10, 22, 60);
+    player.setTexture(makeCircle(scene, r, 0x3ddc97));
+    player.setCircle(r);
+    playerText.setFontSize(clamp(16 + r*0.2, 16, 34));
+  }
+
+  function fightEnemy(scene, enemy) {
+    const eVal = enemy.value;
+    enemy.disableBody(true, true);
+
+    if (player.value >= eVal) {
+      // eat
+      const gain = Math.max(1, Math.floor(eVal * 0.15));
+      addValue(scene, gain);
+      popText(scene, player.x, player.y-48, `- ${eVal} ✅`, 0x3ddc97);
+      score += 60;
+    } else {
+      // game over
+      popText(scene, player.x, player.y-48, `- ${eVal} ❌`, 0xff6b6b);
+      gameOver(scene);
+    }
+  }
+
+  function addValue(scene, add) {
+    player.value = Math.max(1, player.value + add);
+  }
+
+  function gameOver(scene) {
+    state = "OVER";
+    best = Math.max(best, Math.floor(score));
+    localStorage.setItem("ng_best", String(best));
+    uiState.setText(`GAME OVER\n(클릭/탭하면 재시작)`);
+    uiState.setAlpha(0);
+    scene.tweens.add({ targets: uiState, alpha: 1, duration: 220 });
+  }
+
+  function restart(scene) {
+    // reset
+    state = "PLAY";
+    speed = 210;
+    score = 0;
+    player.value = 5;
+    targetX = laneX[1];
+    uiState.setText("");
+
+    // clear groups
+    gates.clear(true, true);
+    enemies.clear(true, true);
+    coins.clear(true, true);
+
+    // reset visuals
+    player.setTexture(makeCircle(scene, 26, 0x3ddc97));
+    player.setCircle(26);
+    player.setPosition(laneX[1], H*0.78);
+    playerText.setFontSize(18);
+
+    nextSpawnY = -220;
+    for (let i=0; i<6; i++) spawnRow(scene);
+    updateUI();
+  }
+
+  function makeGate(scene, x, y, spec) {
+    const w = 110, h = 70;
+    const tex = makeRoundedRect(scene, w, h, 16, 0x132233, 0x25445e);
+    const box = scene.physics.add.image(x, y, tex);
+    box.body.setSize(w, h, true);
+    box.spec = spec;
+
+    const t = scene.add.text(x, y, spec.label, {
+      fontFamily:"system-ui",
+      fontSize:"24px",
+      color:"#d6f3ff",
+      fontStyle:"800"
+    }).setOrigin(0.5);
+
+    // label follow
+    box._label = t;
+    box.preUpdate = function() {
+      if (this._label) this._label.setPosition(this.x, this.y);
+      if (!this.active && this._label) { this._label.destroy(); this._label = null; }
+    };
+
+    return box;
+  }
+
+  function makeEnemy(scene, x, y, value) {
+    const r = 26;
+    const tex = makeCircle(scene, r, 0xff4d4d);
+    const e = scene.physics.add.image(x, y, tex);
+    e.setCircle(r);
+    e.value = value;
+
+    const t = scene.add.text(x, y, fmt(value), {
+      fontFamily:"system-ui",
+      fontSize:"16px",
+      color:"#2b0505",
+      fontStyle:"800"
+    }).setOrigin(0.5);
+
+    e._label = t;
+    e.preUpdate = function() {
+      if (this._label) this._label.setPosition(this.x, this.y);
+      if (!this.active && this._label) { this._label.destroy(); this._label = null; }
+    };
+    return e;
+  }
+
+  function makeCoin(scene, x, y) {
+    const r = 14;
+    const tex = makeCircle(scene, r, 0xffd86b);
+    const c = scene.physics.add.image(x, y, tex);
+    c.setCircle(r);
+    return c;
+  }
+
+  function popText(scene, x, y, text, color) {
+    const t = scene.add.text(x, y, text, {
+      fontFamily:"system-ui",
+      fontSize:"18px",
+      color: "#"+color.toString(16).padStart(6,"0"),
+      fontStyle:"900"
+    }).setOrigin(0.5);
+
+    scene.tweens.add({
+      targets: t,
+      y: y - 28,
+      alpha: 0,
+      duration: 650,
+      onComplete: () => t.destroy()
+    });
+  }
+
+  // texture helpers
+  function makeCircle(scene, radius, fill) {
+    const key = `c_${radius}_${fill}`;
+    if (scene.textures.exists(key)) return key;
+    const g = scene.make.graphics({ x:0, y:0, add:false });
+    g.fillStyle(fill, 1);
+    g.fillCircle(radius, radius, radius);
+    g.generateTexture(key, radius*2, radius*2);
+    g.destroy();
+    return key;
+  }
+
+  function makeRoundedRect(scene, w, h, r, fill, stroke) {
+    const key = `rr_${w}_${h}_${r}_${fill}_${stroke}`;
+    if (scene.textures.exists(key)) return key;
+    const g = scene.make.graphics({ x:0, y:0, add:false });
+    g.fillStyle(fill, 1);
+    g.fillRoundedRect(0, 0, w, h, r);
+    g.lineStyle(4, stroke, 1);
+    g.strokeRoundedRect(0, 0, w, h, r);
+    g.generateTexture(key, w, h);
+    g.destroy();
+    return key;
+  }
+})();
+</script>
+</body>
+</html>
